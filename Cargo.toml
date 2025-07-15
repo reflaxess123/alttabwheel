@@ -1,0 +1,12 @@
+[package]
+name = "alttabwheel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winapi = { version = "0.3", features = ["winuser", "errhandlingapi", "processthreadsapi", "libloaderapi", "winnt"] }
+lazy_static = "1.4"
+
+[[bin]]
+name = "alttabwheel"
+path = "src/main.rs"
