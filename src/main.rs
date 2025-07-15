@@ -1,24 +1,38 @@
+#![windows_subsystem = "windows"]
+
+use std::ffi::OsStr;
+use std::iter::once;
+use std::mem;
+use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use winapi::ctypes::*;
 use winapi::shared::minwindef::*;
-use winapi::um::errhandlingapi::GetLastError;
+use winapi::shared::windef::*;
 use winapi::um::libloaderapi::GetModuleHandleW;
+use winapi::um::shellapi::*;
 use winapi::um::winuser::*;
 
 lazy_static::lazy_static! {
     static ref ALT_TAB_ACTIVE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     static ref XBUTTON1_PRESSED: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     static ref XBUTTON2_PRESSED: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    static ref SHOULD_EXIT: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 }
 
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_XBUTTONDOWN: u32 = 0x020B;
 const WM_XBUTTONUP: u32 = 0x020C;
+const WM_TRAYICON: u32 = WM_USER + 1;
+const ID_TRAY_EXIT: u32 = 1001;
 
 const XBUTTON1: u32 = 0x0001;
 const XBUTTON2: u32 = 0x0002;
+
+fn to_wide_chars(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(once(0)).collect()
+}
 
 fn send_key_combination(vk_codes: &[u32], down: bool) {
     for &vk in vk_codes {
@@ -150,11 +164,136 @@ unsafe extern "system" fn low_level_keyboard_proc(
     CallNextHookEx(ptr::null_mut(), n_code, w_param, l_param)
 }
 
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    msg: UINT,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_TRAYICON => {
+            match l_param as u32 {
+                WM_RBUTTONUP => {
+                    // Show context menu
+                    let mut pt: POINT = mem::zeroed();
+                    GetCursorPos(&mut pt);
+                    
+                    let hmenu = CreatePopupMenu();
+                    if !hmenu.is_null() {
+                        let exit_text = to_wide_chars("Exit");
+                        AppendMenuW(hmenu, MF_STRING, ID_TRAY_EXIT as usize, exit_text.as_ptr());
+                        
+                        SetForegroundWindow(hwnd);
+                        TrackPopupMenu(
+                            hmenu,
+                            TPM_RIGHTBUTTON,
+                            pt.x,
+                            pt.y,
+                            0,
+                            hwnd,
+                            ptr::null(),
+                        );
+                        DestroyMenu(hmenu);
+                    }
+                }
+                _ => {}
+            }
+        }
+        WM_COMMAND => {
+            if u32::from(LOWORD(w_param as u32)) == ID_TRAY_EXIT {
+                SHOULD_EXIT.store(true, Ordering::Relaxed);
+                PostQuitMessage(0);
+            }
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+        }
+        _ => return DefWindowProcW(hwnd, msg, w_param, l_param),
+    }
+    0
+}
+
+fn create_tray_icon(hwnd: HWND) -> bool {
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = mem::zeroed();
+        nid.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        nid.uCallbackMessage = WM_TRAYICON;
+        
+        // Load default application icon
+        nid.hIcon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
+        
+        // Set tooltip
+        let tooltip = to_wide_chars("Alt+Tab Mouse Wheel Navigation");
+        let tooltip_len = tooltip.len().min(128);
+        ptr::copy_nonoverlapping(tooltip.as_ptr(), nid.szTip.as_mut_ptr(), tooltip_len);
+        
+        Shell_NotifyIconW(NIM_ADD, &mut nid) != 0
+    }
+}
+
+fn remove_tray_icon(hwnd: HWND) {
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = mem::zeroed();
+        nid.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &mut nid);
+    }
+}
+
 fn main() {
     unsafe {
         let h_instance = GetModuleHandleW(ptr::null());
         
-        // Install low-level mouse hook
+        // Register window class
+        let class_name = to_wide_chars("AltTabWheelClass");
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(window_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: h_instance,
+            hIcon: LoadIconW(ptr::null_mut(), IDI_APPLICATION),
+            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+            hbrBackground: ptr::null_mut(),
+            lpszMenuName: ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        
+        if RegisterClassW(&wc) == 0 {
+            return;
+        }
+        
+        // Create hidden window
+        let window_name = to_wide_chars("Alt+Tab Mouse Wheel Navigation");
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            window_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            h_instance,
+            ptr::null_mut(),
+        );
+        
+        if hwnd.is_null() {
+            return;
+        }
+        
+        // Create tray icon
+        if !create_tray_icon(hwnd) {
+            return;
+        }
+        
+        // Install hooks
         let mouse_hook = SetWindowsHookExW(
             WH_MOUSE_LL,
             Some(low_level_mouse_proc),
@@ -163,11 +302,10 @@ fn main() {
         );
         
         if mouse_hook.is_null() {
-            eprintln!("Failed to install mouse hook. Error: {}", GetLastError());
+            remove_tray_icon(hwnd);
             return;
         }
         
-        // Install low-level keyboard hook
         let keyboard_hook = SetWindowsHookExW(
             WH_KEYBOARD_LL,
             Some(low_level_keyboard_proc),
@@ -176,18 +314,17 @@ fn main() {
         );
         
         if keyboard_hook.is_null() {
-            eprintln!("Failed to install keyboard hook. Error: {}", GetLastError());
             UnhookWindowsHookEx(mouse_hook);
+            remove_tray_icon(hwnd);
             return;
         }
         
-        println!("Alt+Tab mouse wheel navigation active!");
-        println!("Hold XButton1 or XButton2 and scroll mouse wheel to navigate Alt+Tab");
-        println!("Press Ctrl+C to exit");
-        
         // Message loop
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) != 0 {
+        let mut msg: MSG = mem::zeroed();
+        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+            if SHOULD_EXIT.load(Ordering::Relaxed) {
+                break;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -195,5 +332,6 @@ fn main() {
         // Cleanup
         UnhookWindowsHookEx(mouse_hook);
         UnhookWindowsHookEx(keyboard_hook);
+        remove_tray_icon(hwnd);
     }
 }
